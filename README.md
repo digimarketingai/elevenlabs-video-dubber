@@ -68,7 +68,7 @@ README.md
 Open a new Google Colab notebook and paste this into one code cell:
 
 ```python
-!git clone https://github.com/digimarketinga/elevenlabs-video-dubber.git /content/video-dubber && bash /content/video-dubber/colab.sh
+!git clone https://github.com/digimarketingaii/elevenlabs-video-dubber.git /content/video-dubber && bash /content/video-dubber/colab.sh
 ```
 
 Run the cell, wait for installation, and open the printed Gradio share link.
@@ -339,7 +339,7 @@ Requirements:
 Clone:
 
 ```bash
-git clone https://github.com/digimarketinga/elevenlabs-video-dubber.git
+git clone https://github.com/digimarketingaii/elevenlabs-video-dubber.git
 cd elevenlabs-video-dubber
 ```
 
@@ -536,7 +536,7 @@ README.md
 開啟新的 Google Colab 筆記本，貼上以下指令並執行：
 
 ```python
-!git clone https://github.com/digimarketinga/elevenlabs-video-dubber.git /content/video-dubber && bash /content/video-dubber/colab.sh
+!git clone https://github.com/digimarketingaii/elevenlabs-video-dubber.git /content/video-dubber && bash /content/video-dubber/colab.sh
 ```
 
 等待安裝完成，再開啟畫面中的 Gradio 分享連結。
@@ -786,7 +786,7 @@ subtitle_edits.json
 - 燒錄字幕所需字型。
 
 ```bash
-git clone https://github.com/digimarketinga/elevenlabs-video-dubber.git
+git clone https://github.com/digimarketingaii/elevenlabs-video-dubber.git
 cd elevenlabs-video-dubber
 python -m venv .venv
 ```
