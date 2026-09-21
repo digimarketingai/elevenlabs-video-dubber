@@ -1,0 +1,6 @@
+gradio==6.28.0
+requests>=2.32.5,<3
+yt-dlp[default]
+faster-whisper>=1.2,<2
+srt>=3.5,<4
+opencc-python-reimplemented>=0.1.7,<0.2
