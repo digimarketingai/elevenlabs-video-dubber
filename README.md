@@ -1,8 +1,6 @@
 # 🎬 Video Dubber + Live Subtitle Editor
 # 影片配音與即時字幕編輯器
 
-By [digimarketinga](https://github.com/digimarketinga)
-
 English + Traditional Chinese documentation.  
 英文與繁體中文說明。
 
