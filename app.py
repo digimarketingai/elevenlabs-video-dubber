@@ -22,6 +22,9 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+# No HF token is required. If HF_TOKEN is set in the environment it is used
+# automatically; otherwise models download anonymously.
 
 import gradio as gr
 import requests
@@ -29,6 +32,12 @@ import srt
 from opencc import OpenCC
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+try:  # hide the "unauthenticated requests" warning
+    from huggingface_hub.utils import logging as _hf_logging
+    _hf_logging.set_verbosity_error()
+except Exception:
+    pass
 
 
 # ============================================================
@@ -41,13 +50,14 @@ WORK.mkdir(exist_ok=True)
 
 API = "https://api.elevenlabs.io/v1"
 MAX_BYTES = 500 * 1024 * 1024
+YT_MAX_SECONDS = 3600
 LOCK = threading.Lock()
 
-# Whisper model cache: one model at a time to save memory.
 WHISPER_MODEL = None
 WHISPER_KEY = None      # (model_name, device)
-FORCE_CPU = False       # set to True if CUDA fails at runtime
+FORCE_CPU = False
 CONVERTER = OpenCC("s2twp")
+YTDLP_UPDATED = False
 
 WHISPER_MODELS = ["tiny", "base", "small", "medium", "large-v3-turbo"]
 DEFAULT_WHISPER = "small"
@@ -140,11 +150,6 @@ CSS = """
 }
 """
 
-# Client-side caption updates.
-# This does NOT replace the video src or reset currentTime.
-#
-# Dataframe changes are delivered after a cell edit is committed,
-# e.g. Enter or clicking outside the cell.
 LIVE_JS = r"""
 (original, translated, mode) => {
     const rows = value => {
@@ -165,8 +170,6 @@ LIVE_JS = r"""
         selected = [...rows(original), ...rows(translated)];
     }
 
-    // Merge overlapping intervals into one caption.
-    // Original text appears before translated text in bilingual mode.
     const points = [...new Set(
         selected.flatMap(r => [r[0], r[1]])
     )].sort((a, b) => a - b);
@@ -287,7 +290,6 @@ def media_duration(path):
 
 
 def plain(text):
-    # Subtitle editing is plain text, not HTML/ASS markup editing.
     text = str(text or "").replace("\x00", "").replace("\r", "")
     text = re.sub(r"<[^>]*>", "", text)
     return html.unescape(text).strip()
@@ -333,7 +335,6 @@ def validate_rows(rows, limit=None):
 
 def save_job(job):
     if job.get("directory"):
-        # API keys are never added to job.
         path = Path(job["directory"]) / "job.json"
         temporary = path.with_suffix(".tmp")
         temporary.write_text(
@@ -357,10 +358,175 @@ def selected_video(job, audio_mode):
 
 
 # ============================================================
-# Video preparation and YouTube import
+# YouTube import (robust, multi-strategy)
 # ============================================================
 
-def youtube_download(url, directory, emit):
+class YouTubeLimit(ValueError):
+    """Video is not allowed (live / too long). Do not retry."""
+
+
+class YouTubeFatal(RuntimeError):
+    """Retrying will not help (private, removed, etc.)."""
+
+
+FATAL_MARKERS = (
+    "private video",
+    "video unavailable",
+    "this video is not available",
+    "has been removed",
+    "members-only",
+    "members only",
+    "copyright",
+    "account associated with this video has been terminated",
+    "not made this video available in your country",
+)
+
+
+def find_js_runtimes():
+    """Return yt-dlp --js-runtimes arguments for whatever is installed."""
+    args = []
+    deno = shutil.which("deno")
+    if not deno:
+        candidate = Path(sys.executable).parent / "deno"
+        if candidate.is_file():
+            deno = str(candidate)
+    if deno:
+        args += ["--js-runtimes", f"deno:{deno}"]
+
+    node = shutil.which("node") or shutil.which("nodejs")
+    if node:
+        args += ["--js-runtimes", f"node:{node}"]
+
+    return args
+
+
+def update_ytdlp(emit):
+    """Upgrade yt-dlp once per session; each download is a new process."""
+    global YTDLP_UPDATED
+    if YTDLP_UPDATED:
+        return False
+    YTDLP_UPDATED = True
+
+    emit("Updating yt-dlp / 更新 yt-dlp（YouTube 常常改版）")
+    try:
+        command([
+            sys.executable, "-m", "pip", "install", "-U", "-q",
+            "yt-dlp[default]",
+        ], timeout=300)
+        return True
+    except Exception as exc:
+        emit("yt-dlp update failed: " + str(exc)[-200:])
+        return False
+
+
+def friendly_youtube_error(text, has_cookies):
+    low = text.lower()
+    if "sign in to confirm" in low or "not a bot" in low:
+        hint = (
+            "YouTube is blocking this server (bot check). "
+            "Upload a cookies.txt exported from your own logged-in browser "
+            "(Netscape format), or upload the video file instead.\n"
+            "YouTube 封鎖了此伺服器（機器人驗證）。請上傳由您自己瀏覽器匯出的 "
+            "cookies.txt，或直接上傳影片檔。"
+        )
+        if has_cookies:
+            hint = (
+                "YouTube still blocked the request even with your cookies. "
+                "They may be expired; export fresh cookies, or upload the "
+                "video file.\n" + hint
+            )
+        return hint
+    if "age" in low and ("confirm" in low or "restricted" in low):
+        return (
+            "Age-restricted video: a cookies.txt from a logged-in account "
+            "is required.\n年齡限制影片需要登入帳號的 cookies.txt。"
+        )
+    if "429" in low or "too many requests" in low:
+        return (
+            "YouTube rate-limited this server (HTTP 429). Wait a while, "
+            "use cookies.txt, or upload the file."
+        )
+    if "private video" in low:
+        return "This video is private / 此影片為私人影片"
+    if "unavailable" in low or "removed" in low:
+        return "This video is unavailable / 此影片無法使用"
+    if "requested format is not available" in low:
+        return (
+            "No downloadable format was found (possibly needs a JS runtime "
+            "or cookies). Run `pip install deno` and restart, or upload the "
+            "file."
+        )
+    return "YouTube import failed: " + text[-700:]
+
+
+def _yt_clean(directory):
+    for path in directory.glob("youtube.*"):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _yt_attempt(base, extra, url, directory, emit):
+    cmd = base + extra
+
+    emit("Reading YouTube information / 讀取 YouTube 資訊")
+    try:
+        raw = command(
+            cmd + ["--dump-single-json", "--skip-download", url],
+            timeout=180,
+        )
+        metadata = json.loads(raw)
+    except json.JSONDecodeError:
+        raise RuntimeError("Could not read YouTube metadata") from None
+    except RuntimeError as exc:
+        if any(m in str(exc).lower() for m in FATAL_MARKERS):
+            raise YouTubeFatal(str(exc)) from None
+        raise
+
+    if metadata.get("is_live") or metadata.get("live_status") in {
+        "is_live", "is_upcoming"
+    }:
+        raise YouTubeLimit("Live streams are not supported / 不支援直播")
+
+    duration = metadata.get("duration")
+    if not duration:
+        raise YouTubeLimit("Could not determine video length")
+    if duration > YT_MAX_SECONDS:
+        raise YouTubeLimit(
+            f"Video is longer than {YT_MAX_SECONDS // 60} minutes / "
+            f"影片超過 {YT_MAX_SECONDS // 60} 分鐘"
+        )
+
+    emit(
+        f"Downloading: {str(metadata.get('title', ''))[:60]} "
+        f"({duration:.0f}s) / 下載中"
+    )
+
+    _yt_clean(directory)
+
+    command(cmd + [
+        "-f", "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b",
+        "--merge-output-format", "mp4",
+        "--max-filesize", "500M",
+        "-o", str(directory / "youtube.%(ext)s"),
+        url,
+    ])
+
+    candidates = [
+        p for p in directory.glob("youtube.*")
+        if p.suffix.lower() in {".mp4", ".webm", ".mkv", ".mov"}
+        and p.stat().st_size > 0
+    ]
+    if not candidates:
+        raise RuntimeError(
+            "Download produced no file (it may exceed 500 MB)."
+        )
+
+    return max(candidates, key=lambda p: p.stat().st_size)
+
+
+def youtube_download(url, directory, emit, cookies=None):
     url = (url or "").strip()
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
@@ -377,54 +543,63 @@ def youtube_download(url, directory, emit):
     base = [
         sys.executable, "-m", "yt_dlp",
         "--ignore-config", "--no-playlist", "--no-progress",
-        "--socket-timeout", "30", "--retries", "2",
+        "--no-warnings", "--socket-timeout", "30", "--retries", "3",
     ]
 
-    if shutil.which("deno"):
-        base += ["--js-runtimes", "deno"]
-    elif shutil.which("node"):
-        base += ["--js-runtimes", "node"]
+    runtimes = find_js_runtimes()
+    if runtimes:
+        base += runtimes
     else:
         emit(
-            "YouTube: no JS runtime detected; upload a local file if import fails."
+            "No JS runtime (deno/node) found. YouTube may fail; "
+            "run `pip install deno` or upload a local file."
         )
 
-    emit("Reading YouTube information / 讀取 YouTube 資訊")
-    metadata = json.loads(command(
-        base + ["--dump-single-json", "--skip-download", url],
-        timeout=180,
-    ))
+    if cookies:
+        base += ["--cookies", str(cookies)]
 
-    if (
-        metadata.get("is_live")
-        or not metadata.get("duration")
-        or metadata["duration"] > 1200
-    ):
-        raise ValueError(
-            "Use a non-live YouTube video under 20 minutes."
-        )
-
-    emit("Downloading YouTube source / 下載 YouTube 原始影片")
-
-    command(base + [
-        "-f", "bv*[height<=720]+ba/b[height<=720]/b",
-        "--merge-output-format", "mp4",
-        "--max-filesize", "500M",
-        "-o", str(directory / "youtube.%(ext)s"),
-        url,
-    ])
-
-    candidates = [
-        p for p in directory.glob("youtube.*")
-        if p.suffix.lower() in {".mp4", ".webm", ".mkv", ".mov"}
+    attempts = [
+        ("standard", []),
+        ("alternate clients", [
+            "--extractor-args", "youtube:player_client=default,mweb,tv",
+        ]),
+        ("IPv4 + remote solver", [
+            "--force-ipv4",
+            "--remote-components", "ejs:github",
+            "--extractor-args", "youtube:player_client=tv",
+        ]),
     ]
-    if not candidates:
-        raise RuntimeError(
-            "YouTube import failed. Upload an authorized local video instead."
-        )
 
-    return max(candidates, key=lambda p: p.stat().st_size)
+    last_error = None
 
+    for round_number in range(2):
+        for name, extra in attempts:
+            try:
+                emit(f"YouTube strategy: {name} / 嘗試方式")
+                return _yt_attempt(base, extra, url, directory, emit)
+            except (YouTubeLimit, ValueError):
+                raise
+            except YouTubeFatal as exc:
+                raise RuntimeError(
+                    friendly_youtube_error(str(exc), bool(cookies))
+                ) from None
+            except Exception as exc:
+                last_error = str(exc)
+                emit(f"Strategy '{name}' failed: {last_error[-180:]}")
+
+        if round_number == 0:
+            if not update_ytdlp(emit):
+                break
+            emit("Retrying with updated yt-dlp / 使用新版重試")
+
+    raise RuntimeError(
+        friendly_youtube_error(last_error or "unknown error", bool(cookies))
+    )
+
+
+# ============================================================
+# Video preparation
+# ============================================================
 
 def prepare(job, config, emit):
     start = float(config["start"] or 0)
@@ -439,7 +614,21 @@ def prepare(job, config, emit):
     job["directory"] = str(directory)
 
     if config["input_mode"] == "YouTube":
-        source = youtube_download(config["url"], directory, emit)
+        cookie_file = None
+        if config.get("cookies"):
+            src = Path(config["cookies"])
+            if src.is_file() and src.stat().st_size < 2 * 1024 * 1024:
+                cookie_file = directory / "cookies.txt"
+                shutil.copyfile(src, cookie_file)
+                emit("Using uploaded cookies / 使用上傳的 cookies")
+        try:
+            source = youtube_download(
+                config["url"], directory, emit, cookie_file
+            )
+        finally:
+            # Never keep login cookies on disk after the download.
+            if cookie_file and cookie_file.exists():
+                cookie_file.unlink()
     else:
         if not config["upload"]:
             raise ValueError("Upload a video first / 請先上傳影片")
@@ -713,7 +902,7 @@ def dub(job, config, emit, create=False):
 
 
 # ============================================================
-# Whisper (faster-whisper): GPU when available, CPU fallback
+# Whisper (faster-whisper): no HF token needed; GPU when available
 # ============================================================
 
 def cuda_available():
@@ -727,7 +916,8 @@ def cuda_available():
 
 
 def get_whisper(name, emit):
-    """Load (or reuse) a Whisper model. Tries GPU first, then CPU int8."""
+    """Load (or reuse) a Whisper model. GPU first, then CPU int8.
+    Models download anonymously from the HF Hub; no token required."""
     global WHISPER_MODEL, WHISPER_KEY
 
     name = name if name in WHISPER_MODELS else DEFAULT_WHISPER
@@ -737,14 +927,14 @@ def get_whisper(name, emit):
     if WHISPER_MODEL is not None and WHISPER_KEY == wanted:
         return WHISPER_MODEL
 
-    # Release the previous model before loading another one.
     WHISPER_MODEL = None
     WHISPER_KEY = None
     gc.collect()
 
     emit(
         f"Loading Whisper '{name}' on {wanted[1].upper()}; "
-        "first run downloads the model / 載入辨識模型，首次執行需要下載"
+        "first run downloads the model (no token needed) / "
+        "載入辨識模型，首次執行需要下載（不需要 token）"
     )
     from faster_whisper import WhisperModel
 
@@ -770,7 +960,11 @@ def get_whisper(name, emit):
             last_error = exc
             emit(f"Whisper {device}/{compute_type} unavailable: {str(exc)[:160]}")
 
-    raise RuntimeError(f"Could not load Whisper: {last_error}")
+    raise RuntimeError(
+        f"Could not load Whisper '{name}': {last_error}\n"
+        "If this is a download/rate-limit error, wait a bit or choose a "
+        "smaller model (tiny/base/small)."
+    )
 
 
 def _transcribe_once(path, language, traditional, emit, model_name, task):
@@ -797,7 +991,6 @@ def _transcribe_once(path, language, traditional, emit, model_name, task):
         groups = []
         current = []
 
-        # Shorter caption groups are easier to edit and read.
         for word in words:
             current_text = "".join(w.word for w in current)
             if current and (
@@ -899,7 +1092,6 @@ def generate_subtitles(job, config, emit,
         save_job(job)
 
     elif target == "en":
-        # Whisper can translate speech to English only. No dub needed.
         detected = job.get("detected_language") or job.get("source_language")
         if detected == "en":
             emit(
@@ -1051,7 +1243,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     lines = []
     for start, end, text in rows:
-        # Prevent user text from injecting ASS styling commands.
         text = (
             text.replace("\\", "＼")
             .replace("{", "｛")
@@ -1142,7 +1333,6 @@ def export_job(job, config, emit):
             config["font_size"],
         )
 
-        # Fixed relative filter filename avoids filter-path escaping problems.
         ffmpeg([
             "-i", video,
             "-map", "0:v:0", "-map", "0:a:0",
@@ -1211,7 +1401,6 @@ def task_worker(action, config, job, events):
                 raise ValueError("No session to resume")
             dub(job, config, emit)
 
-            # Resume never overwrites tables that already have content.
             if config["auto_subtitles"]:
                 need_original = not job.get("original_rows")
                 need_translated = not job.get("translated_rows")
@@ -1269,7 +1458,7 @@ def status_card(message, elapsed, running=True, failed=False):
 
 
 INPUT_NAMES = [
-    "key", "input_mode", "upload", "url", "source", "target",
+    "key", "input_mode", "upload", "url", "cookies", "source", "target",
     "start", "length", "quality", "auto_subtitles", "traditional",
     "whisper_model",
     "consent", "audio_mode", "subtitle_mode", "export_mode",
@@ -1296,9 +1485,6 @@ def run_ui(action, *values):
     disabled = [gr.update(interactive=False) for _ in range(BUTTON_COUNT)]
     enabled = [gr.update(interactive=True) for _ in range(BUTTON_COUNT)]
 
-    # Outputs:
-    # status, log, state, original table, translated table,
-    # clean video file, exported files, preview, five action buttons
     yield (
         status_card(message, 0),
         "",
@@ -1387,8 +1573,10 @@ def build_app():
 # 🎬 Video Dubber + Subtitle Editor
 ## 影片配音與即時字幕編輯 · digimarketinga
 
-No app login. Each user supplies their own ElevenLabs key for dubbing.  
+No app login. Each user supplies their own ElevenLabs key for dubbing.
+Whisper captions need **no Hugging Face token** and no API key.  
 不需登入本工具；配音時請使用您自己的 ElevenLabs API 金鑰。
+Whisper 字幕**不需要 Hugging Face token** 或 API 金鑰。
 
 **Editing subtitles does not change spoken audio.**  
 **修改字幕不會重新生成語音。**
@@ -1402,7 +1590,7 @@ Click **Export** to save changes into a new video.
 
         with gr.Accordion("1. Source and dubbing / 來源與配音", open=True):
             key = gr.Textbox(
-                label="ElevenLabs API key / API 金鑰",
+                label="ElevenLabs API key / API 金鑰 (only for dubbing / 僅配音需要)",
                 type="password",
             )
             input_mode = gr.Radio(
@@ -1418,6 +1606,22 @@ Click **Export** to save changes into a new video.
                     file_types=[".mp4", ".mov", ".mkv", ".webm", ".avi"],
                 )
                 url = gr.Textbox(label="YouTube URL / 網址")
+
+            cookies = gr.File(
+                label=(
+                    "Optional cookies.txt for YouTube (Netscape format) / "
+                    "YouTube 選用 cookies.txt — use if you get a bot-check error"
+                ),
+                type="filepath",
+                file_types=[".txt"],
+            )
+            gr.Markdown(
+                "Cookies are used only for this download and deleted right "
+                "after. Public share links have no privacy guarantee, so "
+                "use cookies from a throwaway account if possible.  \n"
+                "Cookies 僅用於本次下載，完成後立即刪除。公開連結無隱私保證，"
+                "建議使用備用帳號的 cookies。"
+            )
 
             with gr.Row():
                 source = gr.Dropdown(
@@ -1451,7 +1655,7 @@ Click **Export** to save changes into a new video.
                     WHISPER_MODELS,
                     value=DEFAULT_WHISPER,
                     label="Whisper model / 辨識模型 (GPU auto-detected / 自動偵測 GPU)",
-                    info="tiny = fastest · large-v3-turbo = most accurate",
+                    info="tiny = fastest · large-v3-turbo = most accurate · no HF token needed",
                 )
 
             auto_subtitles = gr.Checkbox(
@@ -1620,7 +1824,7 @@ Use only trusted instances and avoid sensitive media.
 
         # Order MUST match INPUT_NAMES.
         inputs = [
-            key, input_mode, upload, url, source, target,
+            key, input_mode, upload, url, cookies, source, target,
             start, length, quality, auto_subtitles, traditional,
             whisper_model,
             consent, audio_mode, subtitle_mode, export_mode,
@@ -1673,7 +1877,6 @@ Use only trusted instances and avoid sensitive media.
             queue=False,
         )
 
-        # Browser-only updates: no video re-encoding or re-download.
         gr.on(
             triggers=[
                 original_rows.change,
@@ -1712,6 +1915,11 @@ def main():
     print(
         "Whisper device: "
         + ("CUDA GPU detected" if cuda_available() else "CPU (int8)")
+    )
+    runtimes = find_js_runtimes()
+    print(
+        "YouTube JS runtime: "
+        + (runtimes[1] if runtimes else "NONE (pip install deno)")
     )
 
     app = build_app()
