@@ -943,6 +943,44 @@ def cuda_available():
         return False
 
 
+def load_audio(path, sample_rate=16000):
+    """Decode any media file to a mono float32 numpy array using FFmpeg.
+
+    This deliberately bypasses faster-whisper's own decoder (PyAV), which
+    crashes with "open() got an unexpected keyword argument
+    'metadata_errors'" when the installed `av` package is too old.
+    """
+    import numpy as np
+
+    try:
+        p = subprocess.run(
+            [
+                "ffmpeg", "-nostdin", "-v", "error",
+                "-protocol_whitelist", "file,pipe",
+                "-i", str(path),
+                "-vn", "-map", "0:a:0",
+                "-ac", "1", "-ar", str(sample_rate),
+                "-f", "f32le", "-",
+            ],
+            capture_output=True,
+            timeout=600,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Audio decoding timed out") from None
+
+    if p.returncode:
+        raise RuntimeError(
+            "Could not decode audio: "
+            + p.stderr.decode("utf-8", errors="replace")[-600:]
+        )
+
+    audio = np.frombuffer(p.stdout, dtype=np.float32).copy()
+    if audio.size == 0:
+        raise RuntimeError("The media file contains no audio samples")
+
+    return audio
+
+
 def get_whisper(name, emit):
     """Load (or reuse) a Whisper model. GPU first, then CPU int8.
     Models download anonymously from the HF Hub; no token required."""
@@ -999,8 +1037,12 @@ def _transcribe_once(path, language, traditional, emit, model_name, task):
     model = get_whisper(model_name, emit)
     language = language.split("-")[0] if language else None
 
+    # Decode with FFmpeg ourselves (avoids the PyAV 'metadata_errors' bug).
+    emit("Decoding audio with FFmpeg / 使用 FFmpeg 解碼音訊")
+    samples = load_audio(path)
+
     segments, info = model.transcribe(
-        path,
+        samples,
         language=language,
         task=task,
         beam_size=3,
