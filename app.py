@@ -63,6 +63,14 @@ WHISPER_MODELS = ["tiny", "base", "small", "medium", "large-v3-turbo"]
 DEFAULT_WHISPER = "small"
 CJK = {"zh", "ja", "ko"}
 
+YT_NOTICE = (
+    "⚠️ YouTube download may not always work (YouTube often blocks cloud "
+    "servers such as Colab). If it fails, download the video yourself and "
+    "use the Upload option.\n"
+    "⚠️ YouTube 下載不一定能成功（YouTube 常封鎖 Colab 等雲端伺服器）。"
+    "若失敗，請自行下載影片後改用「上傳」。"
+)
+
 LANGUAGES = {
     "English / 英語": "en",
     "Taiwan Mandarin / 臺灣華語": "zh-TW",
@@ -79,6 +87,10 @@ LANGUAGES = {
 }
 
 AUTO = "Auto detect / 自動偵測"
+
+WORKFLOW_DUB = "Dubbing + subtitles / 配音＋字幕（付費 API）"
+WORKFLOW_SUB = "Subtitles only / 僅字幕（免費、本機 Whisper）"
+WORKFLOWS = [WORKFLOW_DUB, WORKFLOW_SUB]
 
 SUB_MODES = [
     "Translated / 翻譯字幕",
@@ -136,6 +148,12 @@ CSS = """
     background: #6366f1;
     animation: slide 1.5s ease-in-out infinite;
 }
+.yt-warning {
+    padding: 10px 14px;
+    border: 1px solid #f59e0b;
+    border-radius: 10px;
+    background: rgba(245,158,11,.10);
+}
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes slide {
     from { transform: translateX(-110%); }
@@ -191,7 +209,7 @@ LIVE_JS = r"""
         }
     }
 
-    const state = window.__digimarketingaCaptions ||= {
+    const state = window.__editableCaptions ||= {
         version: 0,
         cues: [],
         video: null,
@@ -349,9 +367,15 @@ def selected_video(job, audio_mode):
     path = job.get(key)
 
     if not path or not Path(path).is_file():
+        if key == "dub_video":
+            raise ValueError(
+                "No dubbed video exists (subtitles-only mode?). "
+                "Choose 'Original / 原音' as the audio.\n"
+                "尚無配音影片（僅字幕模式？）。請改選「原音」。"
+            )
         raise ValueError(
-            "Selected audio is unavailable. Prepare a clip or create a dub first.\n"
-            "尚無所選音訊，請先準備影片或建立配音。"
+            "Selected audio is unavailable. Prepare a clip first.\n"
+            "尚無所選音訊，請先準備影片。"
         )
 
     return path
@@ -540,6 +564,8 @@ def youtube_download(url, directory, emit, cookies=None):
     ):
         raise ValueError("Enter a valid YouTube URL / 請輸入有效的 YouTube 網址")
 
+    emit(YT_NOTICE)
+
     base = [
         sys.executable, "-m", "yt_dlp",
         "--ignore-config", "--no-playlist", "--no-progress",
@@ -625,6 +651,8 @@ def prepare(job, config, emit):
             source = youtube_download(
                 config["url"], directory, emit, cookie_file
             )
+        except RuntimeError as exc:
+            raise RuntimeError(f"{exc}\n\n{YT_NOTICE}") from None
         finally:
             # Never keep login cookies on disk after the download.
             if cookie_file and cookie_file.exists():
@@ -698,7 +726,7 @@ def prepare(job, config, emit):
 
 
 # ============================================================
-# ElevenLabs
+# ElevenLabs (dubbing mode only)
 # ============================================================
 
 def api_session(key):
@@ -786,7 +814,7 @@ def dub(job, config, emit, create=False):
             emit("Creating paid dubbing project / 建立配音專案，將使用額度")
 
             data = {
-                "reference": "digimarketinga video subtitle editor",
+                "reference": "video dubber and subtitle editor",
                 "model_id": "dubbing_v2",
                 "target_language": job["target_language"],
             }
@@ -1115,6 +1143,13 @@ def generate_subtitles(job, config, emit,
         job["translated_rows"] = validate_rows(rows, job["duration"])
         save_job(job)
 
+    else:
+        emit(
+            "Free subtitles-only mode can translate into English only. "
+            "Original captions were created; translated captions skipped. / "
+            "免費僅字幕模式只能翻譯成英文；已產生原文字幕，略過翻譯字幕。"
+        )
+
 
 # ============================================================
 # Subtitle import, combination, and export
@@ -1371,9 +1406,14 @@ def task_worker(action, config, job, events):
 
         if action in {"prepare", "dub"}:
             if not config["consent"]:
+                if action == "dub":
+                    raise ValueError(
+                        "Confirm permission and any API charges first.\n"
+                        "請先確認內容授權及可能產生的 API 費用。"
+                    )
                 raise ValueError(
-                    "Confirm permission and any API charges first.\n"
-                    "請先確認內容授權及可能產生的 API 費用。"
+                    "Confirm you have permission to use this content first.\n"
+                    "請先確認您擁有此內容的使用授權。"
                 )
 
             if action == "dub":
@@ -1458,18 +1498,28 @@ def status_card(message, elapsed, running=True, failed=False):
 
 
 INPUT_NAMES = [
-    "key", "input_mode", "upload", "url", "cookies", "source", "target",
-    "start", "length", "quality", "auto_subtitles", "traditional",
-    "whisper_model",
+    "workflow", "key", "input_mode", "upload", "url", "cookies",
+    "source", "target", "start", "length", "quality",
+    "auto_subtitles", "traditional", "whisper_model",
     "consent", "audio_mode", "subtitle_mode", "export_mode",
     "font_size", "original_rows", "translated_rows", "state",
 ]
 
-BUTTON_COUNT = 5
+BUTTON_COUNT = 4  # start, resume, captions, export
 
 
 def run_ui(action, *values):
     config = dict(zip(INPUT_NAMES, values))
+    subtitles_only = (config["workflow"] or "").startswith("Subtitles only")
+
+    # The Start button picks its action from the selected workflow.
+    if action == "start":
+        if subtitles_only:
+            action = "prepare"
+            config["auto_subtitles"] = True   # captions are the whole point
+        else:
+            action = "dub"
+
     new_job = action in {"prepare", "dub"}
     job = {} if new_job else copy.deepcopy(config["state"] or {})
 
@@ -1558,6 +1608,49 @@ def load_preview(job, audio_mode):
         raise gr.Error(str(exc)) from None
 
 
+def apply_workflow(workflow):
+    """Show/hide controls and set sensible defaults for the chosen mode."""
+    if workflow.startswith("Subtitles only"):
+        return (
+            gr.update(visible=False),                       # API key
+            gr.update(
+                label=(
+                    "I have permission to use this content. / "
+                    "我已取得此內容的使用授權。"
+                )
+            ),                                              # consent
+            gr.update(
+                value="Start subtitling (free) / 開始製作字幕（免費）"
+            ),                                              # start button
+            gr.update(visible=False),                       # resume button
+            gr.update(value=AUDIO_MODES[1]),                # original audio
+            gr.update(value=SUB_MODES[1]),                  # original subs
+            gr.update(
+                label=(
+                    "Subtitle translation language / 字幕翻譯語言 "
+                    "(free: English only / 免費僅支援英文)"
+                )
+            ),                                              # target
+        )
+
+    return (
+        gr.update(visible=True),
+        gr.update(
+            label=(
+                "I have content/voice permission and accept API charges "
+                "when dubbing. / 我已取得內容與聲音授權，並同意配音 API 費用。"
+            )
+        ),
+        gr.update(
+            value="Start dubbing + subtitles / 開始配音＋字幕"
+        ),
+        gr.update(visible=True),
+        gr.update(value=AUDIO_MODES[0]),
+        gr.update(value=SUB_MODES[0]),
+        gr.update(label="Dub language / 配音語言"),
+    )
+
+
 # ============================================================
 # Gradio UI
 # ============================================================
@@ -1571,12 +1664,13 @@ def build_app():
 
         gr.Markdown("""
 # 🎬 Video Dubber + Subtitle Editor
-## 影片配音與即時字幕編輯 · digimarketinga
+## 影片配音與即時字幕編輯
 
-No app login. Each user supplies their own ElevenLabs key for dubbing.
-Whisper captions need **no Hugging Face token** and no API key.  
-不需登入本工具；配音時請使用您自己的 ElevenLabs API 金鑰。
-Whisper 字幕**不需要 Hugging Face token** 或 API 金鑰。
+Choose a workflow: **Dubbing + subtitles** (paid ElevenLabs key) or
+**Subtitles only** (free, local Whisper, no API key).
+Whisper needs **no Hugging Face token**.  
+請選擇模式：**配音＋字幕**（需 ElevenLabs 金鑰，付費）或
+**僅字幕**（免費、本機 Whisper、不需金鑰）。Whisper **不需要 Hugging Face token**。
 
 **Editing subtitles does not change spoken audio.**  
 **修改字幕不會重新生成語音。**
@@ -1588,7 +1682,12 @@ Click **Export** to save changes into a new video.
 
         state = gr.State({})
 
-        with gr.Accordion("1. Source and dubbing / 來源與配音", open=True):
+        with gr.Accordion("1. Source and mode / 來源與模式", open=True):
+            workflow = gr.Radio(
+                WORKFLOWS,
+                value=WORKFLOW_DUB,
+                label="Workflow / 工作模式",
+            )
             key = gr.Textbox(
                 label="ElevenLabs API key / API 金鑰 (only for dubbing / 僅配音需要)",
                 type="password",
@@ -1606,6 +1705,15 @@ Click **Export** to save changes into a new video.
                     file_types=[".mp4", ".mov", ".mkv", ".webm", ".avi"],
                 )
                 url = gr.Textbox(label="YouTube URL / 網址")
+
+            gr.Markdown(
+                "⚠️ **YouTube download may not always work.** YouTube often "
+                "blocks cloud servers such as Colab. If it fails, download "
+                "the video yourself and use **Upload** instead.  \n"
+                "⚠️ **YouTube 下載不一定能成功。** YouTube 常封鎖 Colab 等雲端伺服器，"
+                "若失敗，請自行下載影片後改用「上傳」。",
+                elem_classes="yt-warning",
+            )
 
             cookies = gr.File(
                 label=(
@@ -1660,7 +1768,7 @@ Click **Export** to save changes into a new video.
 
             auto_subtitles = gr.Checkbox(
                 value=True,
-                label="Generate captions automatically / 自動產生字幕",
+                label="Generate captions automatically / 自動產生字幕 (always on in subtitles-only mode / 僅字幕模式一律開啟)",
             )
             traditional = gr.Checkbox(
                 value=True,
@@ -1674,20 +1782,9 @@ Click **Export** to save changes into a new video.
                 ),
             )
 
-            gr.Markdown(
-                "Tip: choose **English** as the dub language and press "
-                "**Prepare original only** to get free Whisper-translated "
-                "English captions without dubbing.  \n"
-                "提示：配音語言選「英語」並按「僅準備原音影片」，即可用 Whisper "
-                "免費產生英文翻譯字幕（不配音）。"
-            )
-
             with gr.Row():
-                prepare_button = gr.Button(
-                    "Prepare original only / 僅準備原音影片"
-                )
-                dub_button = gr.Button(
-                    "Create new dub / 建立新配音",
+                start_button = gr.Button(
+                    "Start dubbing + subtitles / 開始配音＋字幕",
                     variant="primary",
                 )
                 resume_button = gr.Button("Resume dub / 繼續查詢配音")
@@ -1818,15 +1915,14 @@ Use only trusted instances and avoid sensitive media.
 """)
 
         buttons = [
-            prepare_button, dub_button, resume_button,
-            captions_button, export_button,
+            start_button, resume_button, captions_button, export_button,
         ]
 
         # Order MUST match INPUT_NAMES.
         inputs = [
-            key, input_mode, upload, url, cookies, source, target,
-            start, length, quality, auto_subtitles, traditional,
-            whisper_model,
+            workflow, key, input_mode, upload, url, cookies,
+            source, target, start, length, quality,
+            auto_subtitles, traditional, whisper_model,
             consent, audio_mode, subtitle_mode, export_mode,
             font_size, original_rows, translated_rows, state,
         ]
@@ -1838,7 +1934,7 @@ Use only trusted instances and avoid sensitive media.
         ]
 
         for button, action in zip(
-            buttons, ["prepare", "dub", "resume", "captions", "export"]
+            buttons, ["start", "resume", "captions", "export"]
         ):
             button.click(
                 partial(run_ui, action),
@@ -1850,6 +1946,17 @@ Use only trusted instances and avoid sensitive media.
                 api_visibility="private",
                 show_progress="minimal",
             )
+
+        workflow.change(
+            apply_workflow,
+            inputs=workflow,
+            outputs=[
+                key, consent, start_button, resume_button,
+                audio_mode, subtitle_mode, target,
+            ],
+            queue=False,
+            api_visibility="private",
+        )
 
         original_srt.upload(
             import_srt,
@@ -1921,6 +2028,7 @@ def main():
         "YouTube JS runtime: "
         + (runtimes[1] if runtimes else "NONE (pip install deno)")
     )
+    print("Note: YouTube download may not always work; use Upload as a fallback.")
 
     app = build_app()
     app.queue(max_size=8)
