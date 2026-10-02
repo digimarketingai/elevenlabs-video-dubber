@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import gc
 import html
 import json
 import math
@@ -42,8 +43,15 @@ API = "https://api.elevenlabs.io/v1"
 MAX_BYTES = 500 * 1024 * 1024
 LOCK = threading.Lock()
 
+# Whisper model cache: one model at a time to save memory.
 WHISPER_MODEL = None
+WHISPER_KEY = None      # (model_name, device)
+FORCE_CPU = False       # set to True if CUDA fails at runtime
 CONVERTER = OpenCC("s2twp")
+
+WHISPER_MODELS = ["tiny", "base", "small", "medium", "large-v3-turbo"]
+DEFAULT_WHISPER = "small"
+CJK = {"zh", "ja", "ko"}
 
 LANGUAGES = {
     "English / 英語": "en",
@@ -705,38 +713,83 @@ def dub(job, config, emit, create=False):
 
 
 # ============================================================
-# Automatic subtitles
+# Whisper (faster-whisper): GPU when available, CPU fallback
 # ============================================================
 
-def transcribe(path, language, traditional, emit):
-    global WHISPER_MODEL
+def cuda_available():
+    if FORCE_CPU:
+        return False
+    try:
+        import ctranslate2
+        return ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        return False
 
-    if WHISPER_MODEL is None:
-        emit(
-            "Loading Whisper small; first run downloads the model / "
-            "載入辨識模型，首次執行需要下載"
-        )
-        from faster_whisper import WhisperModel
 
-        # CPU/int8 avoids CUDA dependency problems in basic Colab runtimes.
-        WHISPER_MODEL = WhisperModel(
-            "small",
-            device="cpu",
-            compute_type="int8",
-            cpu_threads=min(4, os.cpu_count() or 2),
-        )
+def get_whisper(name, emit):
+    """Load (or reuse) a Whisper model. Tries GPU first, then CPU int8."""
+    global WHISPER_MODEL, WHISPER_KEY
 
+    name = name if name in WHISPER_MODELS else DEFAULT_WHISPER
+    use_cuda = cuda_available()
+    wanted = (name, "cuda" if use_cuda else "cpu")
+
+    if WHISPER_MODEL is not None and WHISPER_KEY == wanted:
+        return WHISPER_MODEL
+
+    # Release the previous model before loading another one.
+    WHISPER_MODEL = None
+    WHISPER_KEY = None
+    gc.collect()
+
+    emit(
+        f"Loading Whisper '{name}' on {wanted[1].upper()}; "
+        "first run downloads the model / 載入辨識模型，首次執行需要下載"
+    )
+    from faster_whisper import WhisperModel
+
+    attempts = []
+    if use_cuda:
+        attempts += [("cuda", "float16"), ("cuda", "int8_float16")]
+    attempts.append(("cpu", "int8"))
+
+    last_error = None
+    for device, compute_type in attempts:
+        try:
+            model = WhisperModel(
+                name,
+                device=device,
+                compute_type=compute_type,
+                cpu_threads=min(4, os.cpu_count() or 2),
+            )
+            WHISPER_MODEL = model
+            WHISPER_KEY = (name, device)
+            emit(f"Whisper ready: {name} / {device} / {compute_type}")
+            return model
+        except Exception as exc:
+            last_error = exc
+            emit(f"Whisper {device}/{compute_type} unavailable: {str(exc)[:160]}")
+
+    raise RuntimeError(f"Could not load Whisper: {last_error}")
+
+
+def _transcribe_once(path, language, traditional, emit, model_name, task):
+    model = get_whisper(model_name, emit)
     language = language.split("-")[0] if language else None
 
-    segments, info = WHISPER_MODEL.transcribe(
+    segments, info = model.transcribe(
         path,
         language=language,
-        task="transcribe",
+        task=task,
         beam_size=3,
         vad_filter=True,
         word_timestamps=True,
         condition_on_previous_text=False,
     )
+
+    detected = info.language
+    max_chars = 20 if detected in CJK else 42
+    label = "Translating" if task == "translate" else "Transcribing"
 
     rows = []
     for segment in segments:
@@ -748,7 +801,7 @@ def transcribe(path, language, traditional, emit):
         for word in words:
             current_text = "".join(w.word for w in current)
             if current and (
-                len(current_text) + len(word.word) > 42
+                len(current_text) + len(word.word) > max_chars
                 or word.end - current[0].start > 4.5
             ):
                 groups.append(current)
@@ -768,45 +821,106 @@ def transcribe(path, language, traditional, emit):
 
         for start, end, text in entries:
             text = plain(text)
-            if traditional and info.language == "zh":
+            if traditional and detected == "zh" and task == "transcribe":
                 text = CONVERTER.convert(text)
             if text and end > start:
                 rows.append([round(start, 3), round(end, 3), text])
 
-        emit(
-            f"Transcribing / 辨識中：{segment.end:.1f}s "
-            f"({info.language})"
+        emit(f"{label} / 辨識中：{segment.end:.1f}s ({detected})")
+
+    return rows, detected
+
+
+def transcribe(path, language, traditional, emit,
+               model_name=DEFAULT_WHISPER, task="transcribe"):
+    """Returns (rows, detected_language). Retries on CPU if CUDA fails."""
+    global FORCE_CPU, WHISPER_MODEL, WHISPER_KEY
+
+    try:
+        return _transcribe_once(
+            path, language, traditional, emit, model_name, task
         )
+    except Exception as exc:
+        text = str(exc).lower()
+        cuda_problem = any(
+            token in text
+            for token in ("cuda", "cudnn", "cublas", "libcu", "out of memory")
+        )
+        if WHISPER_KEY and WHISPER_KEY[1] == "cuda" and cuda_problem:
+            emit(
+                "GPU failed, retrying on CPU / GPU 失敗，改用 CPU："
+                + str(exc)[:160]
+            )
+            FORCE_CPU = True
+            WHISPER_MODEL = None
+            WHISPER_KEY = None
+            gc.collect()
+            return _transcribe_once(
+                path, language, traditional, emit, model_name, task
+            )
+        raise
 
-    return rows
 
+def generate_subtitles(job, config, emit,
+                       do_original=True, do_translated=True):
+    model_name = config.get("whisper_model") or DEFAULT_WHISPER
+    traditional = config["traditional"]
 
-def generate_subtitles(job, config, emit):
-    emit("Generating ORIGINAL captions / 產生原文字幕")
+    if do_original:
+        emit("Generating ORIGINAL captions / 產生原文字幕")
 
-    job["original_rows"] = validate_rows(
-        transcribe(
+        rows, detected = transcribe(
             job["clip"],
             job.get("source_language"),
-            config["traditional"],
+            traditional,
             emit,
-        ),
-        job["duration"],
-    )
-    save_job(job)
+            model_name,
+        )
+        job["original_rows"] = validate_rows(rows, job["duration"])
+        job["detected_language"] = detected
+        save_job(job)
+
+    if not do_translated:
+        return
+
+    target = (job.get("target_language") or "").split("-")[0]
 
     if job.get("dub_video"):
         emit("Generating TRANSLATED captions from dub / 從配音產生翻譯字幕")
 
-        job["translated_rows"] = validate_rows(
-            transcribe(
-                job["dub_video"],
-                job["target_language"],
-                config["traditional"],
-                emit,
-            ),
-            job["duration"],
+        rows, _ = transcribe(
+            job["dub_video"],
+            job["target_language"],
+            traditional,
+            emit,
+            model_name,
         )
+        job["translated_rows"] = validate_rows(rows, job["duration"])
+        save_job(job)
+
+    elif target == "en":
+        # Whisper can translate speech to English only. No dub needed.
+        detected = job.get("detected_language") or job.get("source_language")
+        if detected == "en":
+            emit(
+                "Source is already English; skipping translation / "
+                "來源已是英文，略過翻譯"
+            )
+            return
+
+        emit(
+            "Whisper translate → English captions (no dub) / "
+            "Whisper 翻譯成英文字幕（無配音）"
+        )
+        rows, _ = transcribe(
+            job["clip"],
+            job.get("source_language"),
+            False,
+            emit,
+            model_name,
+            task="translate",
+        )
+        job["translated_rows"] = validate_rows(rows, job["duration"])
         save_job(job)
 
 
@@ -1096,9 +1210,17 @@ def task_worker(action, config, job, events):
             if not job.get("clip"):
                 raise ValueError("No session to resume")
             dub(job, config, emit)
-            # Resume does not overwrite existing subtitle edits.
-            if config["auto_subtitles"] and not job.get("translated_rows"):
-                generate_subtitles(job, config, emit)
+
+            # Resume never overwrites tables that already have content.
+            if config["auto_subtitles"]:
+                need_original = not job.get("original_rows")
+                need_translated = not job.get("translated_rows")
+                if need_original or need_translated:
+                    generate_subtitles(
+                        job, config, emit,
+                        do_original=need_original,
+                        do_translated=need_translated,
+                    )
 
         elif action == "captions":
             if not job.get("clip"):
@@ -1149,6 +1271,7 @@ def status_card(message, elapsed, running=True, failed=False):
 INPUT_NAMES = [
     "key", "input_mode", "upload", "url", "source", "target",
     "start", "length", "quality", "auto_subtitles", "traditional",
+    "whisper_model",
     "consent", "audio_mode", "subtitle_mode", "export_mode",
     "font_size", "original_rows", "translated_rows", "state",
 ]
@@ -1323,6 +1446,14 @@ Click **Export** to save changes into a new video.
                     label="Video size / 畫質",
                 )
 
+            with gr.Row():
+                whisper_model = gr.Dropdown(
+                    WHISPER_MODELS,
+                    value=DEFAULT_WHISPER,
+                    label="Whisper model / 辨識模型 (GPU auto-detected / 自動偵測 GPU)",
+                    info="tiny = fastest · large-v3-turbo = most accurate",
+                )
+
             auto_subtitles = gr.Checkbox(
                 value=True,
                 label="Generate captions automatically / 自動產生字幕",
@@ -1337,6 +1468,14 @@ Click **Export** to save changes into a new video.
                     "I have content/voice permission and accept API charges "
                     "when dubbing. / 我已取得內容與聲音授權，並同意配音 API 費用。"
                 ),
+            )
+
+            gr.Markdown(
+                "Tip: choose **English** as the dub language and press "
+                "**Prepare original only** to get free Whisper-translated "
+                "English captions without dubbing.  \n"
+                "提示：配音語言選「英語」並按「僅準備原音影片」，即可用 Whisper "
+                "免費產生英文翻譯字幕（不配音）。"
             )
 
             with gr.Row():
@@ -1400,7 +1539,7 @@ Automatic captions can contain recognition and timing errors. Review them.
                     type="array",
                     value=[],
                     row_count=(0, "dynamic"),
-                    col_count=(3, "fixed"),
+                    column_count=(3, "fixed"),
                     interactive=True,
                     label="Original captions / 原文字幕",
                 )
@@ -1417,7 +1556,7 @@ Automatic captions can contain recognition and timing errors. Review them.
                     type="array",
                     value=[],
                     row_count=(0, "dynamic"),
-                    col_count=(3, "fixed"),
+                    column_count=(3, "fixed"),
                     interactive=True,
                     label="Translated captions / 翻譯字幕",
                 )
@@ -1479,9 +1618,11 @@ Use only trusted instances and avoid sensitive media.
             captions_button, export_button,
         ]
 
+        # Order MUST match INPUT_NAMES.
         inputs = [
             key, input_mode, upload, url, source, target,
             start, length, quality, auto_subtitles, traditional,
+            whisper_model,
             consent, audio_mode, subtitle_mode, export_mode,
             font_size, original_rows, translated_rows, state,
         ]
@@ -1567,6 +1708,11 @@ def main():
             "WARNING: no login is enabled. Public users can consume host "
             "CPU, storage, and bandwidth. Do not use this as private storage."
         )
+
+    print(
+        "Whisper device: "
+        + ("CUDA GPU detected" if cuda_available() else "CPU (int8)")
+    )
 
     app = build_app()
     app.queue(max_size=8)
