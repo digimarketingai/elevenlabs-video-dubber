@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import copy
 import gc
+import hashlib
 import html
 import json
 import math
@@ -16,6 +18,7 @@ import tempfile
 import threading
 import time
 import uuid
+import wave
 from datetime import timedelta
 from functools import partial
 from pathlib import Path
@@ -27,6 +30,7 @@ os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 # automatically; otherwise models download anonymously.
 
 import gradio as gr
+import numpy as np
 import requests
 import srt
 from opencc import OpenCC
@@ -58,6 +62,8 @@ WHISPER_KEY = None      # (model_name, device)
 FORCE_CPU = False
 CONVERTER = OpenCC("s2twp")
 YTDLP_UPDATED = False
+
+TTS_SR = 24000  # sample rate used for the re-dub track
 
 WHISPER_MODELS = ["tiny", "base", "small", "medium", "large-v3-turbo"]
 DEFAULT_WHISPER = "small"
@@ -99,15 +105,41 @@ SUB_MODES = [
     "None / 無字幕",
 ]
 
-AUDIO_MODES = [
-    "Dubbed / 配音",
-    "Original / 原音",
-]
+AUDIO_DUB = "Dubbed / 配音"
+AUDIO_ORIG = "Original / 原音"
+AUDIO_REDUB = "Re-dubbed / 重新配音（學生修訂版）"
+AUDIO_MODES = [AUDIO_DUB, AUDIO_ORIG, AUDIO_REDUB]
 
 EXPORT_MODES = [
     "Soft subtitles / 可關閉字幕 — fast",
     "Burn in / 永久燒錄字幕 — slower",
 ]
+
+TRANSLATORS = [
+    "Google free (deep-translator) / 免費線上翻譯",
+    "Argos offline / 離線翻譯（首次需下載語言包）",
+]
+
+TTS_ENGINES = [
+    "Edge TTS (free, no key) / 免費、不需金鑰",
+    "ElevenLabs TTS (paid key) / 付費金鑰",
+]
+
+# Default Edge TTS voices per target language.
+EDGE_VOICES = {
+    "en": "en-US-AriaNeural",
+    "zh-TW": "zh-TW-HsiaoChenNeural",
+    "zh": "zh-CN-XiaoxiaoNeural",
+    "ja": "ja-JP-NanamiNeural",
+    "ko": "ko-KR-SunHiNeural",
+    "es": "es-ES-ElviraNeural",
+    "fr": "fr-FR-DeniseNeural",
+    "de": "de-DE-KatjaNeural",
+    "it": "it-IT-ElsaNeural",
+    "pt": "pt-BR-FranciscaNeural",
+    "ar": "ar-SA-ZariyahNeural",
+    "hi": "hi-IN-SwaraNeural",
+}
 
 CSS = """
 .gradio-container {
@@ -363,15 +395,27 @@ def save_job(job):
 
 
 def selected_video(job, audio_mode):
-    key = "dub_video" if audio_mode.startswith("Dubbed") else "clip"
+    if audio_mode.startswith("Re-dubbed"):
+        key = "redub_video"
+    elif audio_mode.startswith("Dubbed"):
+        key = "dub_video"
+    else:
+        key = "clip"
+
     path = job.get(key)
 
     if not path or not Path(path).is_file():
+        if key == "redub_video":
+            raise ValueError(
+                "No re-dubbed video yet. Edit the translated subtitles, then "
+                "press the Re-dub button.\n"
+                "尚無重新配音影片。請先修訂翻譯字幕，再按「重新配音」。"
+            )
         if key == "dub_video":
             raise ValueError(
                 "No dubbed video exists (subtitles-only mode?). "
-                "Choose 'Original / 原音' as the audio.\n"
-                "尚無配音影片（僅字幕模式？）。請改選「原音」。"
+                "Choose 'Original / 原音' or 'Re-dubbed' as the audio.\n"
+                "尚無配音影片（僅字幕模式？）。請改選「原音」或「重新配音」。"
             )
         raise ValueError(
             "Selected audio is unavailable. Prepare a clip first.\n"
@@ -726,7 +770,7 @@ def prepare(job, config, emit):
 
 
 # ============================================================
-# ElevenLabs (dubbing mode only)
+# ElevenLabs dubbing (paid dubbing mode only)
 # ============================================================
 
 def api_session(key):
@@ -950,8 +994,6 @@ def load_audio(path, sample_rate=16000):
     crashes with "open() got an unexpected keyword argument
     'metadata_errors'" when the installed `av` package is too old.
     """
-    import numpy as np
-
     try:
         p = subprocess.run(
             [
@@ -1033,7 +1075,7 @@ def get_whisper(name, emit):
     )
 
 
-def _transcribe_once(path, language, traditional, emit, model_name, task):
+def _transcribe_once(path, language, traditional, emit, model_name):
     model = get_whisper(model_name, emit)
     language = language.split("-")[0] if language else None
 
@@ -1044,7 +1086,7 @@ def _transcribe_once(path, language, traditional, emit, model_name, task):
     segments, info = model.transcribe(
         samples,
         language=language,
-        task=task,
+        task="transcribe",
         beam_size=3,
         vad_filter=True,
         word_timestamps=True,
@@ -1053,7 +1095,6 @@ def _transcribe_once(path, language, traditional, emit, model_name, task):
 
     detected = info.language
     max_chars = 20 if detected in CJK else 42
-    label = "Translating" if task == "translate" else "Transcribing"
 
     rows = []
     for segment in segments:
@@ -1084,24 +1125,24 @@ def _transcribe_once(path, language, traditional, emit, model_name, task):
 
         for start, end, text in entries:
             text = plain(text)
-            if traditional and detected == "zh" and task == "transcribe":
+            if traditional and detected == "zh":
                 text = CONVERTER.convert(text)
             if text and end > start:
                 rows.append([round(start, 3), round(end, 3), text])
 
-        emit(f"{label} / 辨識中：{segment.end:.1f}s ({detected})")
+        emit(f"Transcribing / 辨識中：{segment.end:.1f}s ({detected})")
 
     return rows, detected
 
 
 def transcribe(path, language, traditional, emit,
-               model_name=DEFAULT_WHISPER, task="transcribe"):
+               model_name=DEFAULT_WHISPER):
     """Returns (rows, detected_language). Retries on CPU if CUDA fails."""
     global FORCE_CPU, WHISPER_MODEL, WHISPER_KEY
 
     try:
         return _transcribe_once(
-            path, language, traditional, emit, model_name, task
+            path, language, traditional, emit, model_name
         )
     except Exception as exc:
         text = str(exc).lower()
@@ -1119,9 +1160,230 @@ def transcribe(path, language, traditional, emit,
             WHISPER_KEY = None
             gc.collect()
             return _transcribe_once(
-                path, language, traditional, emit, model_name, task
+                path, language, traditional, emit, model_name
             )
         raise
+
+
+# ============================================================
+# Free translation (no API key): deep-translator + Argos offline
+# The translation is ALWAYS row-by-row from the original script, so every
+# translated row keeps the exact start/end of its original row.
+# ============================================================
+
+def _google_target(code):
+    return {"zh-TW": "zh-TW", "zh": "zh-CN"}.get(code, code)
+
+
+def _google_source(code, supported):
+    """Known, supported source code, otherwise 'auto'."""
+    if not code:
+        return "auto"
+    base = code.split("-")[0]
+    if base == "zh":
+        return "auto"          # zh-CN vs zh-TW is ambiguous; let Google decide
+    return base if base in supported else "auto"
+
+
+def _batches(texts, max_chars=3800, max_lines=40):
+    """Yield lists of indices whose joined text stays under the limits."""
+    batch, size = [], 0
+    for index, text in enumerate(texts):
+        if batch and (size + len(text) + 1 > max_chars or len(batch) >= max_lines):
+            yield batch
+            batch, size = [], 0
+        batch.append(index)
+        size += len(text) + 1
+    if batch:
+        yield batch
+
+
+def translate_google(texts, source, target, emit):
+    from deep_translator import GoogleTranslator
+
+    supported = set(
+        GoogleTranslator(source="auto", target="en")
+        .get_supported_languages(as_dict=True).values()
+    )
+    translator = GoogleTranslator(
+        source=_google_source(source, supported),
+        target=_google_target(target),
+    )
+
+    out = [None] * len(texts)
+    failures = 0
+
+    def one(text):
+        nonlocal failures
+        for attempt in range(3):
+            try:
+                result = translator.translate(text)
+                return result if result else text
+            except Exception:
+                time.sleep(1.5 * (attempt + 1))
+        failures += 1
+        if failures > max(3, len(texts) // 2):
+            raise RuntimeError("Google translate endpoint keeps failing")
+        return text
+
+    for ids in _batches(texts):
+        block = "\n".join(texts[i].replace("\n", " ") for i in ids)
+        result = None
+        for attempt in range(3):
+            try:
+                result = translator.translate(block)
+                break
+            except Exception:
+                time.sleep(1.5 * (attempt + 1))
+
+        parts = result.split("\n") if result else []
+        if len(parts) == len(ids) and all(p.strip() for p in parts):
+            for i, part in zip(ids, parts):
+                out[i] = part.strip()
+        else:
+            emit("Batch line count changed; translating line by line / "
+                 "逐行重新翻譯")
+            for i in ids:
+                out[i] = one(texts[i]).strip()
+
+        emit(f"Translated / 已翻譯 {sum(x is not None for x in out)}/{len(texts)}")
+
+    return out
+
+
+def _argos_code(code):
+    return {"zh-TW": "zt", "zh": "zh"}.get(code, (code or "").split("-")[0])
+
+
+def _argos_languages():
+    import argostranslate.translate as at
+    return {lang.code: lang for lang in at.get_installed_languages()}
+
+
+def _argos_has(a, b):
+    langs = _argos_languages()
+    return (
+        a in langs and b in langs
+        and langs[a].get_translation(langs[b]) is not None
+    )
+
+
+def _argos_ensure(a, b, emit):
+    import argostranslate.package as ap
+
+    if _argos_has(a, b):
+        return
+
+    emit(f"Downloading Argos language pack {a}→{b} (first time only) / "
+         "下載離線語言包（僅首次）")
+    ap.update_package_index()
+    available = ap.get_available_packages()
+
+    def install(x, y):
+        package = next(
+            (p for p in available if p.from_code == x and p.to_code == y),
+            None,
+        )
+        if package is None:
+            return False
+        ap.install_from_path(package.download())
+        return True
+
+    if install(a, b) and _argos_has(a, b):
+        return
+
+    ok1 = _argos_has(a, "en") or install(a, "en")
+    ok2 = _argos_has("en", b) or install("en", b)
+    if not (ok1 and ok2 and _argos_has(a, b)):
+        raise RuntimeError(f"Argos has no usable model for {a}→{b}")
+
+
+def translate_argos(texts, source, target, emit):
+    if not source:
+        raise RuntimeError("Argos needs a known source language")
+
+    a, b = _argos_code(source), _argos_code(target)
+    _argos_ensure(a, b, emit)
+
+    langs = _argos_languages()
+    translation = langs[a].get_translation(langs[b])
+
+    out = []
+    for i, text in enumerate(texts, 1):
+        out.append((translation.translate(text) or text).strip())
+        if i % 10 == 0 or i == len(texts):
+            emit(f"Translated (offline) / 已翻譯 {i}/{len(texts)}")
+    return out
+
+
+def translate_lines(texts, source, target, backend, emit):
+    primary = (
+        [("Argos", translate_argos), ("Google", translate_google)]
+        if backend.startswith("Argos")
+        else [("Google", translate_google), ("Argos", translate_argos)]
+    )
+    errors = []
+    for name, function in primary:
+        try:
+            emit(f"Translating with {name} / 使用 {name} 翻譯")
+            result = function(texts, source, target, emit)
+            if len(result) == len(texts):
+                return result
+            raise RuntimeError("line count mismatch")
+        except Exception as exc:
+            errors.append(f"{name}: {str(exc)[:200]}")
+            emit(f"{name} failed, trying the other backend / "
+                 f"{name} 失敗，改用備援：{str(exc)[:160]}")
+
+    raise RuntimeError(
+        "All free translators failed:\n" + "\n".join(errors)
+        + "\nInstall with: pip install deep-translator argostranslate"
+    )
+
+
+def translate_from_original(job, config, emit):
+    """Translate the ORIGINAL rows, keeping identical start/end times."""
+    original = validate_rows(job.get("original_rows"), job["duration"])
+    if not original:
+        raise ValueError(
+            "No original captions to translate. Generate or import them "
+            "first.\n沒有原文字幕可翻譯，請先產生或匯入。"
+        )
+
+    target = job["target_language"]
+    source = job.get("detected_language") or job.get("source_language")
+    same_base = source and source.split("-")[0] == target.split("-")[0]
+
+    if same_base:
+        if target == "zh-TW":
+            emit("Source is Chinese: converting to Traditional only / "
+                 "來源為中文，僅轉換為繁體")
+            texts = [CONVERTER.convert(r[2]) for r in original]
+        else:
+            raise ValueError(
+                "Source and target language are the same. Pick a different "
+                "target language.\n原文與目標語言相同，請選擇不同的目標語言。"
+            )
+    else:
+        texts = translate_lines(
+            [r[2] for r in original],
+            source,
+            target,
+            config.get("translate_backend") or TRANSLATORS[0],
+            emit,
+        )
+        if target == "zh-TW":
+            texts = [CONVERTER.convert(t) for t in texts]
+
+    # Same times as the original row; fall back to source text if empty.
+    job["translated_rows"] = [
+        [row[0], row[1], plain(text) or row[2]]
+        for row, text in zip(original, texts)
+    ]
+    job["draft_translated_rows"] = copy.deepcopy(job["translated_rows"])
+    save_job(job)
+    emit(f"Translated {len(original)} rows with original timing / "
+         f"已依原文時間軸翻譯 {len(original)} 行")
 
 
 def generate_subtitles(job, config, emit,
@@ -1146,9 +1408,8 @@ def generate_subtitles(job, config, emit,
     if not do_translated:
         return
 
-    target = (job.get("target_language") or "").split("-")[0]
-
     if job.get("dub_video"):
+        # Paid dubbing mode: captions follow the spoken dub.
         emit("Generating TRANSLATED captions from dub / 從配音產生翻譯字幕")
 
         rows, _ = transcribe(
@@ -1159,38 +1420,312 @@ def generate_subtitles(job, config, emit,
             model_name,
         )
         job["translated_rows"] = validate_rows(rows, job["duration"])
+        job["draft_translated_rows"] = copy.deepcopy(job["translated_rows"])
         save_job(job)
-
-    elif target == "en":
-        detected = job.get("detected_language") or job.get("source_language")
-        if detected == "en":
-            emit(
-                "Source is already English; skipping translation / "
-                "來源已是英文，略過翻譯"
-            )
-            return
-
-        emit(
-            "Whisper translate → English captions (no dub) / "
-            "Whisper 翻譯成英文字幕（無配音）"
-        )
-        rows, _ = transcribe(
-            job["clip"],
-            job.get("source_language"),
-            False,
-            emit,
-            model_name,
-            task="translate",
-        )
-        job["translated_rows"] = validate_rows(rows, job["duration"])
-        save_job(job)
-
     else:
-        emit(
-            "Free subtitles-only mode can translate into English only. "
-            "Original captions were created; translated captions skipped. / "
-            "免費僅字幕模式只能翻譯成英文；已產生原文字幕，略過翻譯字幕。"
+        # Subtitles-only mode: translate the original script, same timing.
+        translate_from_original(job, config, emit)
+
+
+# ============================================================
+# Re-dubbing from the student's edited translated subtitles
+# ============================================================
+
+def default_edge_voice(target):
+    voice = EDGE_VOICES.get(target) or EDGE_VOICES.get(target.split("-")[0])
+    if not voice:
+        raise ValueError(
+            f"No default Edge voice for '{target}'. Type a voice name in the "
+            "Voice box (run `edge-tts --list-voices`)."
         )
+    return voice
+
+
+def tts_cache_key(engine, voice, rate, text):
+    raw = f"{engine}|{voice}|{rate}|{text}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()[:24]
+
+
+async def _edge_batch(items, voice, rate, emit):
+    import edge_tts
+
+    semaphore = asyncio.Semaphore(3)
+    finished = 0
+    rate_text = f"{rate:+d}%"
+
+    async def one(path, text):
+        nonlocal finished
+        async with semaphore:
+            last = None
+            for attempt in range(3):
+                try:
+                    await edge_tts.Communicate(
+                        text, voice, rate=rate_text
+                    ).save(str(path))
+                    finished += 1
+                    emit(f"Speech synthesized / 已合成語音 {finished}/{len(items)}")
+                    return
+                except Exception as exc:
+                    last = exc
+                    path.unlink(missing_ok=True)
+                    await asyncio.sleep(1 + attempt)
+            raise RuntimeError(f"Edge TTS failed: {last}")
+
+    await asyncio.gather(*(one(p, t) for p, t in items))
+
+
+def eleven_tts_file(text, voice_id, key, path):
+    if not re.fullmatch(r"[A-Za-z0-9]+", voice_id):
+        raise ValueError("Invalid ElevenLabs voice ID")
+
+    last = None
+    for attempt in range(4):
+        try:
+            response = requests.post(
+                f"{API}/text-to-speech/{voice_id}",
+                headers={"xi-api-key": key, "Accept": "audio/mpeg"},
+                params={"output_format": "mp3_44100_128"},
+                json={"text": text, "model_id": "eleven_multilingual_v2"},
+                timeout=(30, 120),
+            )
+        except requests.RequestException:
+            last = "connection error"
+            time.sleep(2 * (attempt + 1))
+            continue
+
+        if response.status_code in {429, 500, 502, 503, 504}:
+            last = f"HTTP {response.status_code}"
+            time.sleep(2 * (attempt + 1))
+            continue
+        if not response.ok:
+            raise RuntimeError(
+                f"ElevenLabs TTS HTTP {response.status_code}: "
+                + response.text[:400]
+            )
+        path.write_bytes(response.content)
+        return
+
+    raise RuntimeError(f"ElevenLabs TTS failed: {last}")
+
+
+def trim_silence(samples, sample_rate, threshold=0.01, pad=0.02):
+    loud = np.flatnonzero(np.abs(samples) > threshold)
+    if loud.size == 0:
+        return samples[:0]
+    margin = int(pad * sample_rate)
+    return samples[max(0, loud[0] - margin): loud[-1] + 1 + margin].copy()
+
+
+def stretch(samples, factor, sample_rate):
+    """Speed up without changing pitch (FFmpeg atempo)."""
+    p = subprocess.run(
+        [
+            "ffmpeg", "-nostdin", "-v", "error",
+            "-f", "f32le", "-ar", str(sample_rate), "-ac", "1", "-i", "pipe:0",
+            "-af", f"atempo={factor:.4f}",
+            "-f", "f32le", "pipe:1",
+        ],
+        input=samples.astype(np.float32).tobytes(),
+        capture_output=True,
+        timeout=120,
+    )
+    if p.returncode or not p.stdout:
+        raise RuntimeError(
+            "Time-stretch failed: " + p.stderr.decode("utf-8", "replace")[-300:]
+        )
+    return np.frombuffer(p.stdout, dtype=np.float32).copy()
+
+
+def write_wav(path, samples, sample_rate):
+    pcm = (np.clip(samples, -1, 1) * 32767).astype("<i2")
+    with wave.open(str(path), "wb") as file:
+        file.setnchannels(1)
+        file.setsampwidth(2)
+        file.setframerate(sample_rate)
+        file.writeframes(pcm.tobytes())
+
+
+def redub(job, config, emit):
+    """Re-dub the clip from the CURRENT (student-edited) translated rows.
+
+    Only rows whose text/voice/rate changed are re-synthesized; everything
+    else comes from the on-disk cache.
+    """
+    rows = validate_rows(job.get("translated_rows"), job["duration"])
+    if not rows:
+        raise ValueError(
+            "No translated subtitles to dub. Generate, import, or type them "
+            "first.\n沒有翻譯字幕可配音，請先產生、匯入或輸入。"
+        )
+
+    use_eleven = (config.get("tts_engine") or "").startswith("ElevenLabs")
+    key = (config.get("key") or "").strip()
+    voice = (config.get("tts_voice") or "").strip()
+    rate = int(config.get("tts_rate") or 0)
+
+    if use_eleven:
+        if not voice:
+            raise ValueError(
+                "ElevenLabs TTS needs a Voice ID in the Voice box.\n"
+                "ElevenLabs 需要在聲音欄位輸入 Voice ID。"
+            )
+        engine, rate = "eleven", 0
+    else:
+        engine = "edge"
+        voice = voice or default_edge_voice(job["target_language"])
+
+    directory = Path(job["directory"])
+    cache = directory / "tts_cache"
+    cache.mkdir(exist_ok=True)
+
+    paths, todo = [], {}
+    for _, _, text in rows:
+        clean = re.sub(r"\s+", " ", text).strip()
+        path = cache / (tts_cache_key(engine, voice, rate, clean) + ".mp3")
+        paths.append(path)
+        if not path.is_file() or path.stat().st_size == 0:
+            todo[path] = clean
+
+    emit(
+        f"Re-dub: {len(rows)} lines, {len(todo)} need new speech, "
+        f"{len(rows) - len(todo)} reused / "
+        f"共 {len(rows)} 行，需合成 {len(todo)} 行，其餘沿用快取"
+    )
+
+    if todo:
+        if use_eleven:
+            for n, (path, text) in enumerate(todo.items(), 1):
+                eleven_tts_file(text, voice, key, path)
+                emit(f"Speech synthesized / 已合成語音 {n}/{len(todo)}")
+        else:
+            try:
+                import edge_tts  # noqa: F401
+            except ImportError:
+                raise RuntimeError("Install Edge TTS: pip install edge-tts") from None
+            asyncio.run(_edge_batch(list(todo.items()), voice, rate, emit))
+
+    sr = TTS_SR
+    duration = job["duration"]
+    track = np.zeros(int(math.ceil(duration * sr)) + sr, dtype=np.float32)
+    max_speed = min(max(float(config.get("max_speed") or 1.35), 1.0), 2.0)
+    draft_texts = {r[2] for r in job.get("draft_translated_rows") or []}
+
+    report = ["#\tstart\tend\tslot_s\tspeech_s\tspeed\tstatus\torigin\ttext"]
+    problems = 0
+
+    for i, (row, path) in enumerate(zip(rows, paths)):
+        start, end, text = row
+        emit(f"Fitting line / 對齊時間 {i + 1}/{len(rows)}")
+
+        clip = trim_silence(load_audio(path, sr), sr)
+        origin = (
+            "n/a" if not draft_texts
+            else ("machine" if text in draft_texts else "edited")
+        )
+
+        if clip.size == 0:
+            report.append(
+                f"{i + 1}\t{start}\t{end}\t{end - start:.2f}\t0\t1\tSILENT\t{origin}\t{text}"
+            )
+            problems += 1
+            continue
+
+        next_start = rows[i + 1][0] if i + 1 < len(rows) else duration
+        slot = end - start
+        # May run a little past the cue end, never into the next cue.
+        budget = max(0.3, min(next_start - start - 0.05, slot + 1.5))
+
+        length = clip.size / sr
+        speed = 1.0
+        if length > budget:
+            speed = min(max_speed, length / budget)
+            if speed > 1.02:
+                clip = stretch(clip, speed, sr)
+                length = clip.size / sr
+            else:
+                speed = 1.0
+
+        status = "ok"
+        if length > budget + 0.05:
+            status = "TOO LONG - shorten text"
+            problems += 1
+
+        fade = min(clip.size // 2, int(0.01 * sr))
+        if fade > 1:
+            ramp = np.linspace(0, 1, fade, dtype=np.float32)
+            clip[:fade] *= ramp
+            clip[-fade:] *= ramp[::-1]
+
+        position = int(start * sr)
+        if position < track.size:
+            stop = min(track.size, position + clip.size)
+            track[position:stop] += clip[: stop - position]
+
+        report.append(
+            f"{i + 1}\t{start}\t{end}\t{slot:.2f}\t{length:.2f}\t{speed:.2f}"
+            f"\t{status}\t{origin}\t{text}"
+        )
+
+    background = float(config.get("bg_volume") or 0)
+    if background > 0:
+        emit("Mixing original audio / 混入原音")
+        bg = load_audio(job["clip"], sr)
+        n = min(bg.size, track.size)
+        track[:n] += bg[:n] * background
+
+    track = track[: int(duration * sr)]
+    peak = float(np.max(np.abs(track))) if track.size else 0.0
+    if peak > 0.98:
+        track *= 0.98 / peak
+
+    old = job.get("redub_dir")
+    out_dir = directory / ("redub_" + uuid.uuid4().hex[:8])
+    out_dir.mkdir()
+
+    wav_path = out_dir / "redub_audio.wav"
+    write_wav(wav_path, track, sr)
+
+    video = out_dir / "redub.mp4"
+    emit("Assembling re-dubbed video / 合併重新配音影片")
+    ffmpeg([
+        "-i", job["clip"], "-i", wav_path,
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "160k",
+        "-t", str(duration),
+        "-movflags", "+faststart",
+        video,
+    ])
+    probe(video)
+
+    report_path = out_dir / "redub_report.tsv"
+    report_path.write_text("\n".join(report), encoding="utf-8-sig")
+
+    used_srt = out_dir / "translated_used.srt"
+    write_srt(used_srt, rows)
+
+    job["redub_video"] = str(video)
+    job["redub_dir"] = str(out_dir)
+    job["redub_voice"] = f"{engine}:{voice}"
+    save_job(job)
+
+    if old and old != str(out_dir):
+        shutil.rmtree(old, ignore_errors=True)
+
+    if problems:
+        emit(
+            f"⚠️ {problems} line(s) do not fit their time slot. Shorten that "
+            "text (see redub_report.tsv) and press Re-dub again; only changed "
+            "lines are re-synthesized.\n"
+            f"⚠️ 有 {problems} 行無法放入時間範圍，請縮短文字後再按重新配音，"
+            "只有修改過的行會重新合成。"
+        )
+    emit(
+        "Re-dub done. Select 'Re-dubbed' as the audio, then press "
+        "Load preview / 完成。音訊請選「重新配音」並按載入預覽。"
+    )
+
+    return [str(video), str(wav_path), str(report_path), str(used_srt)]
 
 
 # ============================================================
@@ -1267,7 +1802,7 @@ def write_srt(path, rows):
         )
         for i, (start, end, text) in enumerate(rows, 1)
     ]
-    path.write_text(srt.compose(entries), encoding="utf-8")
+    Path(path).write_text(srt.compose(entries), encoding="utf-8")
 
 
 def stamp(seconds, separator="."):
@@ -1493,10 +2028,28 @@ def task_worker(action, config, job, events):
                         do_translated=need_translated,
                     )
 
+        elif action == "translate":
+            if not job.get("clip"):
+                raise ValueError("Prepare a clip first")
+            translate_from_original(job, config, emit)
+
         elif action == "captions":
             if not job.get("clip"):
                 raise ValueError("Prepare a clip first")
             generate_subtitles(job, config, emit)
+
+        elif action == "redub":
+            if not job.get("clip"):
+                raise ValueError("Prepare a clip first")
+            if (config.get("tts_engine") or "").startswith("ElevenLabs"):
+                if not (config["key"] or "").strip():
+                    raise ValueError("Enter your ElevenLabs API key first")
+                if not config["consent"]:
+                    raise ValueError(
+                        "Confirm permission and API charges first.\n"
+                        "請先確認授權及可能產生的 API 費用。"
+                    )
+            files = redub(job, config, emit)
 
         elif action == "export":
             if not job.get("clip"):
@@ -1542,12 +2095,15 @@ def status_card(message, elapsed, running=True, failed=False):
 INPUT_NAMES = [
     "workflow", "key", "input_mode", "upload", "url", "cookies",
     "source", "target", "start", "length", "quality",
-    "auto_subtitles", "traditional", "whisper_model",
+    "auto_subtitles", "traditional", "whisper_model", "translate_backend",
     "consent", "audio_mode", "subtitle_mode", "export_mode",
-    "font_size", "original_rows", "translated_rows", "state",
+    "font_size", "tts_engine", "tts_voice", "tts_rate", "max_speed",
+    "bg_volume", "original_rows", "translated_rows", "state",
 ]
 
-BUTTON_COUNT = 4  # start, resume, captions, export
+# start, resume, translate, captions, redub, export
+ACTIONS = ["start", "resume", "translate", "captions", "redub", "export"]
+BUTTON_COUNT = len(ACTIONS)
 
 
 def run_ui(action, *values):
@@ -1621,7 +2177,10 @@ def run_ui(action, *values):
             )
             continue
 
-        base_file = snapshot.get("dub_video") or snapshot.get("clip")
+        if action == "redub" and kind == "done":
+            base_file = snapshot.get("redub_video")
+        else:
+            base_file = snapshot.get("dub_video") or snapshot.get("clip")
 
         yield (
             status_card(
@@ -1654,7 +2213,6 @@ def apply_workflow(workflow):
     """Show/hide controls and set sensible defaults for the chosen mode."""
     if workflow.startswith("Subtitles only"):
         return (
-            gr.update(visible=False),                       # API key
             gr.update(
                 label=(
                     "I have permission to use this content. / "
@@ -1665,18 +2223,17 @@ def apply_workflow(workflow):
                 value="Start subtitling (free) / 開始製作字幕（免費）"
             ),                                              # start button
             gr.update(visible=False),                       # resume button
-            gr.update(value=AUDIO_MODES[1]),                # original audio
+            gr.update(value=AUDIO_ORIG),                    # original audio
             gr.update(value=SUB_MODES[1]),                  # original subs
             gr.update(
                 label=(
                     "Subtitle translation language / 字幕翻譯語言 "
-                    "(free: English only / 免費僅支援英文)"
+                    "(free translation, any language / 免費翻譯）"
                 )
             ),                                              # target
         )
 
     return (
-        gr.update(visible=True),
         gr.update(
             label=(
                 "I have content/voice permission and accept API charges "
@@ -1687,7 +2244,7 @@ def apply_workflow(workflow):
             value="Start dubbing + subtitles / 開始配音＋字幕"
         ),
         gr.update(visible=True),
-        gr.update(value=AUDIO_MODES[0]),
+        gr.update(value=AUDIO_DUB),
         gr.update(value=SUB_MODES[0]),
         gr.update(label="Dub language / 配音語言"),
     )
@@ -1709,13 +2266,15 @@ def build_app():
 ## 影片配音與即時字幕編輯
 
 Choose a workflow: **Dubbing + subtitles** (paid ElevenLabs key) or
-**Subtitles only** (free, local Whisper, no API key).
-Whisper needs **no Hugging Face token**.  
+**Subtitles only** (free: local Whisper + free translation, no API key).
+Translated subtitles are translated **from the original script and keep its
+exact timing**. Students can edit them and **re-dub** from the edited text.  
 請選擇模式：**配音＋字幕**（需 ElevenLabs 金鑰，付費）或
-**僅字幕**（免費、本機 Whisper、不需金鑰）。Whisper **不需要 Hugging Face token**。
+**僅字幕**（免費：本機 Whisper＋免費翻譯，不需金鑰）。
+翻譯字幕由**原文字幕逐行翻譯，時間軸與原文完全相同**。學生修訂後可按**重新配音**。
 
-**Editing subtitles does not change spoken audio.**  
-**修改字幕不會重新生成語音。**
+**Editing subtitles does not change spoken audio until you press Re-dub.**  
+**修改字幕不會改變語音，需按「重新配音」才會重新生成。**
 
 Live preview updates after a cell edit is committed.
 Click **Export** to save changes into a new video.  
@@ -1731,7 +2290,11 @@ Click **Export** to save changes into a new video.
                 label="Workflow / 工作模式",
             )
             key = gr.Textbox(
-                label="ElevenLabs API key / API 金鑰 (only for dubbing / 僅配音需要)",
+                label=(
+                    "ElevenLabs API key / API 金鑰 "
+                    "(only for ElevenLabs dubbing or ElevenLabs TTS / "
+                    "僅 ElevenLabs 配音或語音需要)"
+                ),
                 type="password",
             )
             input_mode = gr.Radio(
@@ -1807,6 +2370,12 @@ Click **Export** to save changes into a new video.
                     label="Whisper model / 辨識模型 (GPU auto-detected / 自動偵測 GPU)",
                     info="tiny = fastest · large-v3-turbo = most accurate · no HF token needed",
                 )
+                translate_backend = gr.Dropdown(
+                    TRANSLATORS,
+                    value=TRANSLATORS[0],
+                    label="Free translator / 免費翻譯引擎",
+                    info="Falls back to the other engine automatically / 失敗時自動改用另一個引擎",
+                )
 
             auto_subtitles = gr.Checkbox(
                 value=True,
@@ -1838,7 +2407,7 @@ Click **Export** to save changes into a new video.
             interactive=False,
         )
         clean_download = gr.File(
-            label="Prepared video without added subtitles / 未加字幕的影片"
+            label="Latest video without added subtitles / 最新未加字幕的影片"
         )
 
         gr.Markdown("""
@@ -1851,14 +2420,14 @@ Use Enter or click outside a cell to commit an edit.
 Add/delete rows using the table controls. Empty text rows are ignored.  
 按 Enter 或點選儲存格外完成編輯；可新增或刪除字幕列，空白文字列會被忽略。
 
-Automatic captions can contain recognition and timing errors. Review them.  
-自動字幕可能有辨識及時間誤差，請自行檢查。
+Automatic captions and free machine translation can contain errors. Review them.  
+自動字幕與免費機器翻譯可能有誤，請自行檢查。
 """)
 
         with gr.Row():
             audio_mode = gr.Radio(
                 AUDIO_MODES,
-                value=AUDIO_MODES[0],
+                value=AUDIO_DUB,
                 label="Preview/export audio / 預覽及匯出音訊",
             )
             subtitle_mode = gr.Radio(
@@ -1909,12 +2478,65 @@ Automatic captions can contain recognition and timing errors. Review them.
                     type="filepath",
                 )
 
-        captions_button = gr.Button(
-            "Regenerate captions — replaces tables / 重新辨識字幕，取代表格"
+        with gr.Row():
+            translate_button = gr.Button(
+                "Translate original → translated (free, same timing) — "
+                "replaces translated table / "
+                "由原文字幕免費翻譯（時間軸不變），取代翻譯表格"
+            )
+            captions_button = gr.Button(
+                "Regenerate captions — replaces both tables / "
+                "重新辨識字幕，取代兩個表格"
+            )
+
+        gr.Markdown("""
+## 3. Re-dub from edited translation / 依修訂後翻譯重新配音
+
+Edit the **Translated** table (text and timing), then press **Re-dub**.
+Each line is spoken at its start time and sped up (up to the limit) to fit.
+Only lines you changed are re-synthesized, so repeat runs are fast. Lines that
+cannot fit are listed in `redub_report.tsv` as *TOO LONG*: shorten them.
+Afterwards choose **Re-dubbed** as the audio and press *Load preview*.  
+修訂**翻譯**表格（文字與時間）後按**重新配音**。每行從開始時間朗讀，必要時加速（有上限）。
+只有修改過的行會重新合成，所以重複執行很快。放不下的行會在 `redub_report.tsv`
+標示為 *TOO LONG*，請縮短文字。完成後音訊選「重新配音」並按「載入預覽」。
+""")
+
+        with gr.Row():
+            tts_engine = gr.Radio(
+                TTS_ENGINES,
+                value=TTS_ENGINES[0],
+                label="Voice engine / 語音引擎",
+            )
+            tts_voice = gr.Textbox(
+                label=(
+                    "Voice / 聲音 — Edge: voice name (blank = default) · "
+                    "ElevenLabs: Voice ID (required)"
+                ),
+                placeholder="e.g. zh-TW-HsiaoChenNeural",
+            )
+
+        with gr.Row():
+            tts_rate = gr.Slider(
+                -30, 30, value=0, step=5,
+                label="Edge speech rate % / Edge 語速 %",
+            )
+            max_speed = gr.Slider(
+                1.0, 1.6, value=1.35, step=0.05,
+                label="Max speed-up to fit timing / 為對齊時間的最大加速倍率",
+            )
+            bg_volume = gr.Slider(
+                0, 0.5, value=0, step=0.05,
+                label="Original audio volume underneath / 底層原音音量 (0 = off; speech may leak)",
+            )
+
+        redub_button = gr.Button(
+            "Re-dub from edited translated subtitles / 依修訂後翻譯字幕重新配音",
+            variant="primary",
         )
 
         gr.Markdown("""
-## 3. Export / 匯出
+## 4. Export / 匯出
 
 **Soft subtitles:** fastest, selectable in supporting players.  
 **可關閉字幕：** 較快，需播放器支援字幕軌。
@@ -1942,7 +2564,7 @@ The live preview checks text/timing; burned-in styling may look different.
             variant="primary",
         )
         downloads = gr.File(
-            label="Export downloads / 匯出檔案下載",
+            label="Downloads (export / re-dub files) / 下載檔案",
             file_count="multiple",
         )
 
@@ -1956,17 +2578,20 @@ Use only trusted instances and avoid sensitive media.
 公開分享連結**沒有登入及個別使用者檔案隱私保證**，請勿上傳敏感內容。
 """)
 
+        # Order MUST match ACTIONS.
         buttons = [
-            start_button, resume_button, captions_button, export_button,
+            start_button, resume_button, translate_button,
+            captions_button, redub_button, export_button,
         ]
 
         # Order MUST match INPUT_NAMES.
         inputs = [
             workflow, key, input_mode, upload, url, cookies,
             source, target, start, length, quality,
-            auto_subtitles, traditional, whisper_model,
+            auto_subtitles, traditional, whisper_model, translate_backend,
             consent, audio_mode, subtitle_mode, export_mode,
-            font_size, original_rows, translated_rows, state,
+            font_size, tts_engine, tts_voice, tts_rate, max_speed,
+            bg_volume, original_rows, translated_rows, state,
         ]
 
         outputs = [
@@ -1975,9 +2600,7 @@ Use only trusted instances and avoid sensitive media.
             *buttons,
         ]
 
-        for button, action in zip(
-            buttons, ["start", "resume", "captions", "export"]
-        ):
+        for button, action in zip(buttons, ACTIONS):
             button.click(
                 partial(run_ui, action),
                 inputs=inputs,
@@ -1993,7 +2616,7 @@ Use only trusted instances and avoid sensitive media.
             apply_workflow,
             inputs=workflow,
             outputs=[
-                key, consent, start_button, resume_button,
+                consent, start_button, resume_button,
                 audio_mode, subtitle_mode, target,
             ],
             queue=False,
@@ -2070,6 +2693,15 @@ def main():
         "YouTube JS runtime: "
         + (runtimes[1] if runtimes else "NONE (pip install deno)")
     )
+    for module, package in [
+        ("deep_translator", "deep-translator"),
+        ("argostranslate", "argostranslate"),
+        ("edge_tts", "edge-tts"),
+    ]:
+        try:
+            __import__(module)
+        except ImportError:
+            print(f"Optional: pip install {package}")
     print("Note: YouTube download may not always work; use Upload as a fallback.")
 
     app = build_app()
